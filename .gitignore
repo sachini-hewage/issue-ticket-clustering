@@ -1,7 +1,13 @@
-.ipynb_checkpoints/
-__pycache__/
+# Ignore data files
+*.jsonl
+*.csv
+*.pkl
+
+# Common junk files
 .DS_Store
-.env
+__pycache__/
+.ipynb_checkpoints/
+
+# Virtual environments
 venv/
-.pkl
-.csv
+.env/
