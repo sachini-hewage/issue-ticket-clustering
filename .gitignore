@@ -2,7 +2,7 @@
 venv/
 .env/
 
-# Data and model files
+# Large data and model files
 *.pkl
 *.pt
 *.csv
@@ -11,11 +11,10 @@ venv/
 *.npy
 *.npz
 
-# Large dependency files
+# Large binaries
 *.dylib
 
-# Jupyter auto-saves
+# Jupyter and Python junk
 .ipynb_checkpoints/
-
-# macOS junk
+__pycache__/
 .DS_Store
