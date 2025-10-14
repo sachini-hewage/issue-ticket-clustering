@@ -1,13 +1,21 @@
-# Ignore data files
-*.jsonl
-*.csv
-*.pkl
-
-# Common junk files
-.DS_Store
-__pycache__/
-.ipynb_checkpoints/
-
 # Virtual environments
 venv/
 .env/
+
+# Data and model files
+*.pkl
+*.pt
+*.csv
+*.jsonl
+*.h5
+*.npy
+*.npz
+
+# Large dependency files
+*.dylib
+
+# Jupyter auto-saves
+.ipynb_checkpoints/
+
+# macOS junk
+.DS_Store
