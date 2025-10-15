@@ -2,7 +2,7 @@
 import os
 from dotenv import load_dotenv
 import psycopg2
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.orm import sessionmaker
 from src.config import DB_URL, BATCH_SIZE
 
@@ -32,6 +32,58 @@ def get_db_credentials():
 
 engine = create_engine(DB_URL)
 SessionLocal = sessionmaker(bind=engine)
+
+
+
+
+import pandas as pd
+from sqlalchemy import text
+
+def fetch_and_cleanup_tickets(ticket_ids):
+    """
+    Fetch specified tickets from the 'tickets' table while deleting
+    related records from 'ticket_preprocessed' and 'ticket_embeddings'.
+
+    Parameters
+    ----------
+    ticket_ids : list of str
+        List of ticket IDs to fetch.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing fetched ticket records.
+    """
+    if not ticket_ids:
+        raise ValueError("ticket_ids list cannot be empty")
+
+    ticket_tuple = tuple(ticket_ids)
+
+    with engine.connect() as conn:
+        # Fetch tickets as DataFrame
+        query_fetch = text("""
+            SELECT * FROM tickets
+            WHERE ticket_id IN :ticket_ids;
+        """)
+        df = pd.read_sql(query_fetch, conn, params={"ticket_ids": ticket_tuple})
+
+        # Delete from ticket_preprocessed
+        conn.execute(text("""
+            DELETE FROM ticket_preprocessed
+            WHERE ticket_id IN :ticket_ids;
+        """), {"ticket_ids": ticket_tuple})
+
+        # Delete from ticket_embeddings
+        conn.execute(text("""
+            DELETE FROM ticket_embeddings
+            WHERE ticket_id IN :ticket_ids;
+        """), {"ticket_ids": ticket_tuple})
+
+        # Commit the deletions
+        conn.commit()
+
+    return df
+
 
 
 
@@ -81,6 +133,28 @@ def fetch_already_embedded_ticket_ids():
 #                     for tid, emb in batch]
 #             conn.execute(insert_sql, data)
 
+
+
+
+def write_tickets_to_ticket_preprocessed(df,table_name="ticket_preprocessed", if_exists="append"):
+    """
+    Write a pandas DataFrame to a database table.
+
+    Args:
+        df (pd.DataFrame): DataFrame to write.
+        db_url (str): SQLAlchemy database URL (e.g., 'postgresql://user:pass@host:port/dbname').
+        table_name (str): Name of the table in the database.
+        if_exists (str): What to do if table exists. Options: 'fail', 'replace', 'append'.
+
+    Returns:
+        None
+    """
+
+    # Write DataFrame to the table
+    df.to_sql(table_name, engine, if_exists=if_exists, index=False)
+    print(f"[INFO] DataFrame written to table '{table_name}' successfully.")
+
+
 def insert_embeddings(records):
     """
     Insert embeddings into ticket_embeddings table.
@@ -102,4 +176,53 @@ def insert_embeddings(records):
                 emb_str = "[" + ",".join(map(str, emb)) + "]"  # Postgres expects string literal for VECTOR
                 data.append({"ticket_id": tid, "embedding": emb_str})
             conn.execute(insert_sql, data)
+
+
+
+def update_ticket_with_cluster_and_recommendation(ticket_id, cluster_id, cluster_label, suggestion, confidence):
+    """
+    Update the tickets table with cluster_id, cluster_label, next_step, and confidence.
+    Automatically adds missing columns if they don't exist.
+    """
+    inspector = inspect(engine)
+    columns = [col["name"] for col in inspector.get_columns("tickets")]
+
+    # Identify missing columns
+    alter_stmts = []
+    if "cluster_id" not in columns:
+        alter_stmts.append("ALTER TABLE tickets ADD COLUMN cluster_id INTEGER;")
+    if "cluster_label" not in columns:
+        alter_stmts.append("ALTER TABLE tickets ADD COLUMN cluster_label TEXT;")
+    if "next_step" not in columns:
+        alter_stmts.append("ALTER TABLE tickets ADD COLUMN next_step TEXT;")
+    if "confidence" not in columns:
+        alter_stmts.append("ALTER TABLE tickets ADD COLUMN confidence FLOAT;")
+
+    # Add missing columns
+    if alter_stmts:
+        with engine.begin() as conn:
+            for stmt in alter_stmts:
+                conn.execute(text(stmt))
+        print(f"[INFO] Added missing columns: {', '.join([stmt.split()[3] for stmt in alter_stmts])}")
+
+    # Update record with new information
+    query = text("""
+        UPDATE tickets
+        SET cluster_id = :cluster_id,
+            cluster_label = :cluster_label,
+            next_step = :suggestion,
+            confidence = :confidence
+        WHERE ticket_id = :ticket_id
+    """)
+
+    with engine.begin() as conn:
+        conn.execute(query, {
+            "cluster_id": cluster_id,
+            "cluster_label": cluster_label,
+            "suggestion": suggestion,
+            "confidence": confidence,
+            "ticket_id": ticket_id
+        })
+
+    print(f"Table \"tickets\" updated with {ticket_id}'s cluster_id, cluster_label, suggestion and confidence.")
 

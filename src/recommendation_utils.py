@@ -17,6 +17,8 @@ from src.ai_utils import generate_llm_summary
 from src.config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME
 import datetime
 import ast
+import hdbscan
+from src.db_utils import update_ticket_with_cluster_and_recommendation
 
 # Create reusable DB engine for SQLAlchemy
 def get_engine():
@@ -120,38 +122,34 @@ def find_recommendation(ticket_id, top_k=5):
     """
     Recommend the next step for a given ticket.
 
-    Steps:
-        1. Fetch current ticket's embedding & internal comments.
-        2. Identify its cluster (predict if missing).
-        3. Find the closest ticket in the same cluster.
-        4. Prefer resolved/closed tickets; else use nearest open one.
-        5. Compare internal comments & ask LLM for the next recommended step.
-        6. Fetch cluster label from DB if available.
-
-    Parameters:
-        ticket_id (str): Ticket identifier.
-        top_k (int): Number of similar tickets to consider (default=5).
-
     Returns:
-        tuple: (suggestion_text, confidence_score, cluster_id, cluster_label, best_comments, nearest_ticket_id)
+        tuple: (
+            suggestion_text,
+            confidence_score,
+            cluster_id,
+            cluster_label,
+            best_comments,
+            nearest_ticket_id,
+            nearest_ticket_status
+        )
     """
-
     # Fetch current ticket embedding and details
     ticket = get_ticket_embedding(ticket_id)
 
     if ticket is None:
-        return "Ticket not found.", 0.0, None, None, None, None
+        return "Ticket not found.", 0.0, None, None, None, None, None
 
     # Predict cluster if missing or unassigned (-1)
     if ticket.get("cluster_id") is None or ticket["cluster_id"] == -1:
         if clusterer is None or reducer is None:
             raise RuntimeError("Clusterer or UMAP reducer not loaded. Cannot predict cluster.")
         reduced = reducer.transform([ticket["embedding"]])
-        cluster_pred, _ = clusterer.approximate_predict(clusterer, reduced)
+        cluster_pred, strengths = hdbscan.approximate_predict(clusterer, reduced)
         cluster_id = int(cluster_pred[0])
+        cluster_strength = float(strengths[0])
         ticket["cluster_id"] = cluster_id
 
-        # Update in DB
+        # Update cluster_id in DB
         with engine.begin() as conn:
             conn.execute(
                 text("UPDATE ticket_embeddings SET cluster_id = :cid WHERE ticket_id = :tid"),
@@ -159,6 +157,7 @@ def find_recommendation(ticket_id, top_k=5):
             )
     else:
         cluster_id = ticket["cluster_id"]
+        cluster_strength = 1.0  # Existing cluster, assume strong assignment
 
     # Retrieve neighbors from same cluster
     query = text("""
@@ -171,7 +170,7 @@ def find_recommendation(ticket_id, top_k=5):
         neighbors = pd.DataFrame(conn.execute(query, {"cid": cluster_id, "tid": ticket_id}))
 
     if neighbors.empty:
-        return "No similar tickets found for recommendation.", 0.0, cluster_id, None, None, None
+        return "No similar tickets found for recommendation.", cluster_strength, cluster_id, None, None, None, None
 
     # Compute cosine similarity between current ticket and neighbors
     neighbor_embs = np.vstack([
@@ -188,15 +187,15 @@ def find_recommendation(ticket_id, top_k=5):
     else:
         best = neighbors.iloc[neighbors["similarity"].argmax()]
 
-    confidence = float(best["similarity"])
     best_comments = clean_internal_comments(best["internal_comments"]) if best["internal_comments"] else ""
     nearest_ticket_id = best["ticket_id"]
+    nearest_ticket_status = best["status"]
 
-    # Construct prompt for the LLM
-    if best["status"] in ("closed", "resolved"):
+    # Construct prompt for LLM
+    if nearest_ticket_status in ("closed", "resolved"):
         prompt = f"""
         You are a support assistant.
-        
+
         The current ticket's internal comments so far are:
         {ticket['comments_cleaned']}
 
@@ -209,7 +208,7 @@ def find_recommendation(ticket_id, top_k=5):
     else:
         prompt = f"""
         You are a support assistant.
-        
+
         The current ticket's internal comments so far are:
         {ticket['comments_cleaned']}
 
@@ -220,10 +219,10 @@ def find_recommendation(ticket_id, top_k=5):
         Return only the suggested next step.
         """
 
-    # Generate recommendation
+    # Generate LLM recommendation
     suggestion = generate_llm_summary(prompt)
 
-    # Fetch cluster label from SQL table
+    # Fetch cluster label
     cluster_label = None
     with engine.connect() as conn:
         result = conn.execute(
@@ -233,9 +232,29 @@ def find_recommendation(ticket_id, top_k=5):
         if result:
             cluster_label = result[0]
 
-    # Logging for transparency
-    print(f"Ticket {ticket_id} → Cluster {cluster_id} ({cluster_label}) → "
-          f"Nearest ticket: {nearest_ticket_id} → Recommended action: {suggestion} (confidence: {confidence:.2f})")
+    # Update the main tickets table
+    update_ticket_with_cluster_and_recommendation(
+        ticket_id=ticket_id,
+        cluster_id=cluster_id,
+        cluster_label=cluster_label,
+        suggestion=suggestion,
+        confidence=cluster_strength
+    )
 
-    return suggestion, confidence, cluster_id, cluster_label, best_comments, nearest_ticket_id
+    # # Log summary
+    # print(
+    #     f"Ticket {ticket_id} → Cluster {cluster_id} ({cluster_label}) | "
+    #     f"Strength: {cluster_strength:.2f} | Nearest: {nearest_ticket_id} ({nearest_ticket_status}) | "
+    #     f"Action: {suggestion}"
+    # )
 
+    # Return full tuple
+    return (
+        suggestion,
+        cluster_strength,
+        cluster_id,
+        cluster_label,
+        best_comments,
+        nearest_ticket_id,
+        nearest_ticket_status
+    )

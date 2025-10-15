@@ -2,12 +2,14 @@
 import re
 import torch
 import spacy
+import pandas as pd
 from langdetect import detect
 from langdetect.lang_detect_exception import LangDetectException
 from transformers import MarianTokenizer, MarianMTModel
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+from src.db_utils import write_tickets_to_ticket_preprocessed
 
 # MODEL SETUP
 
@@ -236,4 +238,89 @@ def extract_keywords_batch(texts, top_n=10, log_every=1000):
 
     print(f"[INFO] Keyword extraction completed for {len(texts)} texts")
     return all_keywords
+
+
+
+
+def preprocess_tickets(df, top_n_keywords=10):
+    """
+    Apply full preprocessing pipeline on a DataFrame of tickets.
+    Steps:
+      1. Language detection
+      2. Text cleaning
+      3. Translation to English (if model available)
+      4. PII masking
+      5. Combine text and remove greetings
+      6. Keyword extraction
+
+    Expects columns: 'ticket_id', 'subject', 'body'
+    Returns a new DataFrame with processed columns added.
+    """
+
+    df = df.copy()
+
+    # Detect language and clean text 
+    cleaned_data = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Cleaning & detecting language"):
+        subject = row.get("subject", "")
+        body = row.get("body", "")
+
+        lang = detect_language(body)
+        subject_clean = clean_text(subject)
+        body_clean = clean_text(body)
+
+        cleaned_data.append({
+            "ticket_id": row["ticket_id"],
+            "lang": lang,
+            "subject_clean": subject_clean,
+            "body_clean": body_clean
+        })
+
+    df_cleaned = pd.DataFrame(cleaned_data)
+
+    # Translation (batch by language)
+    df_cleaned["subject_translated"] = ""
+    df_cleaned["body_translated"] = ""
+
+    for lang in TRANSLATION_MODELS.keys():
+        idx = df_cleaned[df_cleaned["lang"] == lang].index
+        if len(idx) == 0:
+            continue
+
+        subjects = df_cleaned.loc[idx, "subject_clean"].tolist()
+        bodies = df_cleaned.loc[idx, "body_clean"].tolist()
+
+        df_cleaned.loc[idx, "subject_translated"] = translate_texts_batch(subjects, lang)
+        df_cleaned.loc[idx, "body_translated"] = translate_texts_batch(bodies, lang)
+        print(f"[INFO] Translated {len(idx)} tickets from '{lang}' to English")
+
+    # Fill English/unknown with original cleaned content
+    mask = df_cleaned["subject_translated"] == ""
+    df_cleaned.loc[mask, "subject_translated"] = df_cleaned.loc[mask, "subject_clean"]
+    df_cleaned.loc[mask, "body_translated"] = df_cleaned.loc[mask, "body_clean"]
+
+    # PII masking
+    tqdm.pandas(desc="Masking PII")
+    df_cleaned["subject_masked"] = df_cleaned["subject_translated"].progress_apply(mask_pii_en)
+    df_cleaned["body_masked"] = df_cleaned["body_translated"].progress_apply(mask_pii_en)
+
+    # Combine text columns into one for keyword extraction
+    df_cleaned["combined_text"] = df_cleaned["subject_translated"] + " || " + df_cleaned["body_masked"]
+
+    # Remove greetings like 'hi', 'hello', 'hey'
+    greetings_pattern = r'\b(hi|hello|hey)\b'
+    df_cleaned["combined_text"] = df_cleaned["combined_text"].apply(
+        lambda x: re.sub(greetings_pattern, '', x, flags=re.IGNORECASE)
+    )
+    # Remove extra whitespace
+    df_cleaned["combined_text"] = df_cleaned["combined_text"].str.replace(r'\s+', ' ', regex=True).str.strip()
+
+    # Keyword extraction ---
+    all_texts = df_cleaned["combined_text"].tolist()
+    df_cleaned["keywords"] = extract_keywords_batch(all_texts, top_n=top_n_keywords)
+
+    write_tickets_to_ticket_preprocessed(df_cleaned)
+    print("Preprocessed rows written to \"ticket_preprocessed\" table.")
+
+    return df_cleaned
 
