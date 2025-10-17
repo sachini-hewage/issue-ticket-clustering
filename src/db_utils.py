@@ -179,9 +179,9 @@ def insert_embeddings(records):
 
 
 
-def update_ticket_with_cluster_and_recommendation(ticket_id, cluster_id, cluster_label, suggestion, confidence):
+def update_ticket_with_cluster_and_recommendation(ticket_id, cluster_id, cluster_label, suggestion, cluster_confidence, neighbour_confidence):
     """
-    Update the tickets table with cluster_id, cluster_label, next_step, and confidence.
+    Update the tickets table with cluster_id, cluster_label, next_step, and cluster_confidence and neighbour_confidence.
     Automatically adds missing columns if they don't exist.
     """
     inspector = inspect(engine)
@@ -195,8 +195,10 @@ def update_ticket_with_cluster_and_recommendation(ticket_id, cluster_id, cluster
         alter_stmts.append("ALTER TABLE tickets ADD COLUMN cluster_label TEXT;")
     if "next_step" not in columns:
         alter_stmts.append("ALTER TABLE tickets ADD COLUMN next_step TEXT;")
-    if "confidence" not in columns:
-        alter_stmts.append("ALTER TABLE tickets ADD COLUMN confidence FLOAT;")
+    if "cluster_confidence" not in columns:
+        alter_stmts.append("ALTER TABLE tickets ADD COLUMN cluster_confidence FLOAT;")
+    if "neighbour_confidence" not in columns:
+        alter_stmts.append("ALTER TABLE tickets ADD COLUMN neighbour_confidence FLOAT;")
 
     # Add missing columns
     if alter_stmts:
@@ -211,7 +213,8 @@ def update_ticket_with_cluster_and_recommendation(ticket_id, cluster_id, cluster
         SET cluster_id = :cluster_id,
             cluster_label = :cluster_label,
             next_step = :suggestion,
-            confidence = :confidence
+            cluster_confidence = :cluster_confidence,
+            neighbour_confidence = :neighbour_confidence
         WHERE ticket_id = :ticket_id
     """)
 
@@ -220,9 +223,10 @@ def update_ticket_with_cluster_and_recommendation(ticket_id, cluster_id, cluster
             "cluster_id": cluster_id,
             "cluster_label": cluster_label,
             "suggestion": suggestion,
-            "confidence": confidence,
+            "cluster_confidence": cluster_confidence,
+            "neighbour_confidence" : neighbour_confidence,
             "ticket_id": ticket_id
         })
 
-    print(f"Table \"tickets\" updated with {ticket_id}'s cluster_id, cluster_label, suggestion and confidence.")
+    print(f"Table \"tickets\" updated with {ticket_id}'s cluster_id, cluster_label, suggestion and confidences.")
 
