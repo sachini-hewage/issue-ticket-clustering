@@ -1,5 +1,6 @@
 # src/db_utils.py
 import os
+import pandas as pd
 from dotenv import load_dotenv
 import psycopg2
 from sqlalchemy import create_engine, text, inspect
@@ -36,36 +37,27 @@ SessionLocal = sessionmaker(bind=engine)
 
 
 
-import pandas as pd
-from sqlalchemy import text
-
 def fetch_and_cleanup_tickets(ticket_ids):
     """
-    Fetch specified tickets from the 'tickets' table while deleting
-    related records from 'ticket_preprocessed' and 'ticket_embeddings'.
+    Fetch specified tickets from the 'tickets' table while:
+      - Deleting related records from 'ticket_preprocessed' and 'ticket_embeddings'
+      - Clearing cluster-related fields in the 'tickets' table.
 
     Parameters
-    ----------
     ticket_ids : list of str
         List of ticket IDs to fetch.
 
     Returns
-    -------
     pandas.DataFrame
         DataFrame containing fetched ticket records.
     """
     if not ticket_ids:
         raise ValueError("ticket_ids list cannot be empty")
 
+    # Ensure tuple formatting for SQL IN clause
     ticket_tuple = tuple(ticket_ids)
 
-    with engine.connect() as conn:
-        # Fetch tickets as DataFrame
-        query_fetch = text("""
-            SELECT * FROM tickets
-            WHERE ticket_id IN :ticket_ids;
-        """)
-        df = pd.read_sql(query_fetch, conn, params={"ticket_ids": ticket_tuple})
+    with engine.begin() as conn:  # `begin()` automatically commits or rolls back
 
         # Delete from ticket_preprocessed
         conn.execute(text("""
@@ -79,10 +71,27 @@ def fetch_and_cleanup_tickets(ticket_ids):
             WHERE ticket_id IN :ticket_ids;
         """), {"ticket_ids": ticket_tuple})
 
-        # Commit the deletions
-        conn.commit()
+        # Clear cluster-related fields in tickets table
+        conn.execute(text("""
+            UPDATE tickets
+            SET 
+                cluster_id = NULL,
+                cluster_label = NULL,
+                next_step = NULL,
+                cluster_confidence = NULL,
+                neighbour_confidence = NULL
+            WHERE ticket_id IN :ticket_ids;
+        """), {"ticket_ids": ticket_tuple})
+        
+        # Fetch the tickets
+        query_fetch = text("""
+            SELECT * FROM tickets
+            WHERE ticket_id IN :ticket_ids;
+        """)
+        df = pd.read_sql(query_fetch, conn, params={"ticket_ids": ticket_tuple})
 
     return df
+
 
 
 

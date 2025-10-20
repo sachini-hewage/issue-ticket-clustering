@@ -118,10 +118,149 @@ def get_ticket_embedding(ticket_id):
 
 
 
+# def find_recommendation(ticket_id, top_k=5):
+#     """
+#     Recommend the next step for a given ticket.
+
+#     Returns:
+#         tuple: (
+#             suggestion_text,
+#             cluster_confidence,
+#             neighbour_confidence,
+#             cluster_id,
+#             cluster_label,
+#             best_comments,
+#             nearest_ticket_id,
+#             nearest_ticket_status
+#         )
+#     """
+#     # Fetch current ticket embedding and details
+#     ticket = get_ticket_embedding(ticket_id)
+
+#     if ticket is None:
+#         return "Ticket not found.", 0.0, 0.0, None, None, None, None, None
+
+#     # Predict cluster if missing or unassigned (-1)
+#     if ticket.get("cluster_id") is None or ticket["cluster_id"] == -1:
+#         if clusterer is None or reducer is None:
+#             raise RuntimeError("Clusterer or UMAP reducer not loaded. Cannot predict cluster.")
+#         reduced = reducer.transform([ticket["embedding"]])
+#         cluster_pred, strengths = hdbscan.approximate_predict(clusterer, reduced)
+#         cluster_id = int(cluster_pred[0])
+#         cluster_confidence = float(strengths[0])
+#         ticket["cluster_id"] = cluster_id
+
+#         # Update cluster_id in DB
+#         with engine.begin() as conn:
+#             conn.execute(
+#                 text("UPDATE ticket_embeddings SET cluster_id = :cid WHERE ticket_id = :tid"),
+#                 {"cid": cluster_id, "tid": ticket_id}
+#             )
+#     else:
+#         cluster_id = ticket["cluster_id"]
+#         cluster_confidence = 1.0  # Existing cluster, assume strong assignment
+
+#     # Retrieve neighbors from same cluster
+#     query = text("""
+#         SELECT te.ticket_id, te.embedding, t.status, t.internal_comments
+#         FROM ticket_embeddings te
+#         JOIN tickets t ON te.ticket_id = t.ticket_id
+#         WHERE te.cluster_id = :cid AND te.ticket_id != :tid
+#     """)
+#     with engine.connect() as conn:
+#         neighbors = pd.DataFrame(conn.execute(query, {"cid": cluster_id, "tid": ticket_id}))
+
+#     if neighbors.empty:
+#         return "No similar tickets found for recommendation.", cluster_confidence, 0.0, cluster_id, None, None, None, None
+
+#     # Compute cosine similarity between current ticket and neighbors
+#     neighbor_embs = np.vstack([
+#         np.array(ast.literal_eval(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
+#         for x in neighbors["embedding"]
+#     ])
+#     sims = cosine_similarity([ticket["embedding"]], neighbor_embs).flatten()
+#     neighbors["similarity"] = sims
+
+#     # Pick best neighbour
+#     resolved = neighbors[neighbors["status"].isin(["closed", "resolved"])]
+#     if not resolved.empty:
+#         best = resolved.iloc[resolved["similarity"].argmax()]
+#     else:
+#         best = neighbors.iloc[neighbors["similarity"].argmax()]
+
+#     neighbour_confidence = float(best["similarity"])
+#     best_comments = clean_internal_comments(best["internal_comments"]) if best["internal_comments"] else ""
+#     nearest_ticket_id = best["ticket_id"]
+#     nearest_ticket_status = best["status"]
+
+#     # Construct LLM prompt
+#     if nearest_ticket_status in ("closed", "resolved"):
+#         prompt = f"""
+#         You are a support assistant.
+
+#         The current ticket's internal comments so far are:
+#         {ticket['comments_cleaned']}
+
+#         The most similar RESOLVED ticket's comments are:
+#         {best_comments}
+
+#         Based on this, suggest the next logical action for the current ticket in one clear sentence.
+#         Return only the suggested action.
+#         """
+#     else:
+#         prompt = f"""
+#         You are a support assistant.
+
+#         The current ticket's internal comments so far are:
+#         {ticket['comments_cleaned']}
+
+#         The most similar OPEN ticket's comments are:
+#         {best_comments}
+
+#         Suggest a helpful next step aligned with the ongoing situation.
+#         Return only the suggested next step.
+#         """
+
+#     # Generate recommendation
+#     suggestion = generate_llm_summary(prompt)
+
+#     # Fetch cluster label
+#     cluster_label = None
+#     with engine.connect() as conn:
+#         result = conn.execute(
+#             text("SELECT label FROM cluster_labels WHERE cluster_id = :cid"),
+#             {"cid": cluster_id}
+#         ).fetchone()
+#         if result:
+#             cluster_label = result[0]
+
+#     # Update main tickets table
+#     update_ticket_with_cluster_and_recommendation(
+#         ticket_id=ticket_id,
+#         cluster_id=cluster_id,
+#         cluster_label=cluster_label,
+#         suggestion=suggestion,
+#         cluster_confidence=cluster_confidence,
+#         neighbour_confidence= neighbour_confidence
+#     )
+
+#     # Return full tuple
+#     return (
+#         suggestion,
+#         cluster_confidence,
+#         neighbour_confidence,
+#         cluster_id,
+#         cluster_label,
+#         best_comments,
+#         nearest_ticket_id,
+#         nearest_ticket_status
+#     )
+
+
 def find_recommendation(ticket_id, top_k=5):
     """
-    Recommend the next step for a given ticket.
-
+    Recommend a resolution for a given ticket, using neighbors in the same cluster if relevant.
+    
     Returns:
         tuple: (
             suggestion_text,
@@ -129,19 +268,41 @@ def find_recommendation(ticket_id, top_k=5):
             neighbour_confidence,
             cluster_id,
             cluster_label,
+            ticket_subject,
             best_comments,
             nearest_ticket_id,
-            nearest_ticket_status
+            nearest_ticket_status,
+            cleaned_internal_comments
         )
     """
-    # Fetch current ticket embedding and details
-    ticket = get_ticket_embedding(ticket_id)
+    # Fetch ticket embedding, internal comments, and subject
+    query = text("""
+        SELECT te.ticket_id, te.embedding, te.cluster_id, t.internal_comments, t.subject
+        FROM ticket_embeddings te
+        JOIN tickets t ON te.ticket_id = t.ticket_id
+        WHERE te.ticket_id = :tid
+    """)
+    with engine.connect() as conn:
+        result = conn.execute(query, {"tid": ticket_id}).fetchone()
 
-    if ticket is None:
-        return "Ticket not found.", 0.0, 0.0, None, None, None, None, None
+    if not result:
+        return "Ticket not found.", 0.0, 0.0, None, None, None, None, None, None, None
 
-    # Predict cluster if missing or unassigned (-1)
-    if ticket.get("cluster_id") is None or ticket["cluster_id"] == -1:
+    ticket = {
+        "ticket_id": result.ticket_id,
+        "embedding": np.array(ast.literal_eval(result.embedding), dtype=np.float32)
+                    if isinstance(result.embedding, str) else np.array(result.embedding, dtype=np.float32),
+        "cluster_id": result.cluster_id,
+        "internal_comments": result.internal_comments or "",
+        "subject": result.subject or ""
+    }
+
+    # Clean current internal comments
+    current_comments = clean_internal_comments(ticket["internal_comments"])
+    ticket_subject = ticket["subject"]
+
+    # Predict cluster if missing or unassigned
+    if ticket["cluster_id"] is None or ticket["cluster_id"] == -1:
         if clusterer is None or reducer is None:
             raise RuntimeError("Clusterer or UMAP reducer not loaded. Cannot predict cluster.")
         reduced = reducer.transform([ticket["embedding"]])
@@ -150,7 +311,6 @@ def find_recommendation(ticket_id, top_k=5):
         cluster_confidence = float(strengths[0])
         ticket["cluster_id"] = cluster_id
 
-        # Update cluster_id in DB
         with engine.begin() as conn:
             conn.execute(
                 text("UPDATE ticket_embeddings SET cluster_id = :cid WHERE ticket_id = :tid"),
@@ -158,22 +318,33 @@ def find_recommendation(ticket_id, top_k=5):
             )
     else:
         cluster_id = ticket["cluster_id"]
-        cluster_confidence = 1.0  # Existing cluster, assume strong assignment
+        cluster_confidence = 1.0
 
-    # Retrieve neighbors from same cluster
-    query = text("""
+    # Retrieve neighbors
+    query_neighbors = text("""
         SELECT te.ticket_id, te.embedding, t.status, t.internal_comments
         FROM ticket_embeddings te
         JOIN tickets t ON te.ticket_id = t.ticket_id
         WHERE te.cluster_id = :cid AND te.ticket_id != :tid
     """)
     with engine.connect() as conn:
-        neighbors = pd.DataFrame(conn.execute(query, {"cid": cluster_id, "tid": ticket_id}))
+        neighbors = pd.DataFrame(conn.execute(query_neighbors, {"cid": cluster_id, "tid": ticket_id}))
 
     if neighbors.empty:
-        return "No similar tickets found for recommendation.", cluster_confidence, 0.0, cluster_id, None, None, None, None
+        return (
+            "No similar tickets found for recommendation.",
+            cluster_confidence,
+            0.0,
+            cluster_id,
+            None,
+            ticket_subject,
+            None,
+            None,
+            None,
+            current_comments
+        )
 
-    # Compute cosine similarity between current ticket and neighbors
+    # Compute similarity
     neighbor_embs = np.vstack([
         np.array(ast.literal_eval(x), dtype=np.float32) if isinstance(x, str) else np.array(x, dtype=np.float32)
         for x in neighbors["embedding"]
@@ -181,12 +352,9 @@ def find_recommendation(ticket_id, top_k=5):
     sims = cosine_similarity([ticket["embedding"]], neighbor_embs).flatten()
     neighbors["similarity"] = sims
 
-    # Pick best neighbour
+    # Select best neighbor
     resolved = neighbors[neighbors["status"].isin(["closed", "resolved"])]
-    if not resolved.empty:
-        best = resolved.iloc[resolved["similarity"].argmax()]
-    else:
-        best = neighbors.iloc[neighbors["similarity"].argmax()]
+    best = resolved.iloc[resolved["similarity"].argmax()] if not resolved.empty else neighbors.iloc[neighbors["similarity"].argmax()]
 
     neighbour_confidence = float(best["similarity"])
     best_comments = clean_internal_comments(best["internal_comments"]) if best["internal_comments"] else ""
@@ -194,31 +362,32 @@ def find_recommendation(ticket_id, top_k=5):
     nearest_ticket_status = best["status"]
 
     # Construct LLM prompt
-    if nearest_ticket_status in ("closed", "resolved"):
+    if neighbour_confidence > 0.8:
         prompt = f"""
-        You are a support assistant.
+        You are a support assistant inside a card services provider.Here is a current issue ticket that a customer contacted you about.
 
-        The current ticket's internal comments so far are:
-        {ticket['comments_cleaned']}
+        Ticket Subject: {ticket_subject}
 
-        The most similar RESOLVED ticket's comments are:
+        Current ticket internal comments:
+        {current_comments}
+
+        Most similar RESOLVED ticket's comments:
         {best_comments}
 
-        Based on this, suggest the next logical action for the current ticket in one clear sentence.
-        Return only the suggested action.
+        Based on these, suggest a next step for the current ticket in one sentence.
+        Return only the suggestion in English.
         """
     else:
         prompt = f"""
-        You are a support assistant.
+        You are a support assistant inside a card services provider.Here is a current issue ticket that a customer contacted you about.
 
-        The current ticket's internal comments so far are:
-        {ticket['comments_cleaned']}
+        Ticket Subject: {ticket_subject}
 
-        The most similar OPEN ticket's comments are:
-        {best_comments}
+        Current ticket internal comments:
+        {current_comments}
 
-        Suggest a helpful next step aligned with the ongoing situation.
-        Return only the suggested next step.
+        Suggest one practical next step for the current ticket in one sentence.
+        Return only the suggestion in English.
         """
 
     # Generate recommendation
@@ -227,12 +396,12 @@ def find_recommendation(ticket_id, top_k=5):
     # Fetch cluster label
     cluster_label = None
     with engine.connect() as conn:
-        result = conn.execute(
+        result_label = conn.execute(
             text("SELECT label FROM cluster_labels WHERE cluster_id = :cid"),
             {"cid": cluster_id}
         ).fetchone()
-        if result:
-            cluster_label = result[0]
+        if result_label:
+            cluster_label = result_label[0]
 
     # Update main tickets table
     update_ticket_with_cluster_and_recommendation(
@@ -241,18 +410,19 @@ def find_recommendation(ticket_id, top_k=5):
         cluster_label=cluster_label,
         suggestion=suggestion,
         cluster_confidence=cluster_confidence,
-        neighbour_confidence= neighbour_confidence
+        neighbour_confidence=neighbour_confidence
     )
 
-    # Return full tuple
     return (
         suggestion,
         cluster_confidence,
         neighbour_confidence,
         cluster_id,
         cluster_label,
-        best_comments,
+        best_comments if neighbour_confidence > 0.8 else None,
         nearest_ticket_id,
-        nearest_ticket_status
+        nearest_ticket_status,
+        current_comments
     )
+
 
