@@ -7,6 +7,10 @@ from sqlalchemy import text, create_engine
 from src.config import DB_URL
 from sqlalchemy.orm import sessionmaker
 import warnings
+import os
+import hashlib
+import pickle
+
 
 warnings.filterwarnings("ignore", module="umap")
 
@@ -57,17 +61,19 @@ def fetch_ticket_pair_details(ticket_id, neighbour_id, cluster_id):
 
 
 
-def plot_all_clusters(ticket_id, n_neighbors=30, min_dist=0.0, metric="cosine"):
+
+
+_cache = {}  # simple in-memory cache
+
+def plot_all_clusters(ticket_id, n_neighbors=30, min_dist=0.0, metric="cosine", cache_dir="./cache"):
     """
     Plot a 2D UMAP projection of all clusters, highlighting a given ticket and its neighbour.
-
-    Parameters:
-        ticket_id (str): Main ticket to highlight.
-        n_neighbors (int): UMAP n_neighbors parameter.
-        min_dist (float): UMAP min_dist parameter.
-        metric (str): Distance metric for UMAP.
+    Efficient version with caching.
     """
-    # Load all embeddings with cluster info
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    # Step 1: Get a hash key based on parameters and DB state
     query = text("""
         SELECT ticket_id, embedding, cluster_id
         FROM ticket_embeddings
@@ -81,22 +87,38 @@ def plot_all_clusters(ticket_id, n_neighbors=30, min_dist=0.0, metric="cosine"):
         print("No ticket embeddings found.")
         return
 
-    # Convert embeddings from string to numpy array if needed
-    df["embedding"] = df["embedding"].apply(lambda x: np.array(eval(x)) if isinstance(x, str) else np.array(x))
+    # Generate a unique hash key for caching
+    df_hash = hashlib.md5(pd.util.hash_pandas_object(df, index=False).values.tobytes()).hexdigest()
+    cache_key = f"umap_{n_neighbors}_{min_dist}_{metric}_{df_hash}"
+    cache_file = os.path.join(cache_dir, f"{cache_key}.pkl")
 
-    # UMAP 2D reduction
-    reducer = umap.UMAP(
-        n_neighbors=n_neighbors,
-        min_dist=min_dist,
-        metric=metric,
-        random_state=42
-    )
-    reduced = reducer.fit_transform(np.vstack(df["embedding"]))
-    df["x"], df["y"] = reduced[:, 0], reduced[:, 1]
+    # Step 2: Check memory or disk cache
+    if cache_key in _cache:
+        df, reduced = _cache[cache_key]
+    elif os.path.exists(cache_file):
+        with open(cache_file, "rb") as f:
+            df, reduced = pickle.load(f)
+        _cache[cache_key] = (df, reduced)
+    else:
+        # Step 3: Compute embeddings and reduce
+        df["embedding"] = df["embedding"].apply(lambda x: np.array(eval(x)) if isinstance(x, str) else np.array(x))
 
+        reducer = umap.UMAP(
+            n_neighbors=n_neighbors,
+            min_dist=min_dist,
+            metric=metric,
+            random_state=42
+        )
+        reduced = reducer.fit_transform(np.vstack(df["embedding"]))
+        df["x"], df["y"] = reduced[:, 0], reduced[:, 1]
+
+        # Save cache
+        with open(cache_file, "wb") as f:
+            pickle.dump((df, reduced), f)
+        _cache[cache_key] = (df, reduced)
+
+    # Step 4: Plot
     plt.figure(figsize=(12, 8))
-
-    # Plot each cluster in a different color
     clusters = df["cluster_id"].unique()
     colors = plt.cm.get_cmap("tab20", len(clusters))
 
@@ -116,8 +138,8 @@ def plot_all_clusters(ticket_id, n_neighbors=30, min_dist=0.0, metric="cosine"):
     plt.xlabel("UMAP-1")
     plt.ylabel("UMAP-2")
     plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    #plt.tight_layout()
     plt.show()
+
 
 
 
