@@ -10,7 +10,7 @@ DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "enfuce_ai_support")
+DB_NAME = os.getenv("DB_NAME", "example_ai_support")
 
 
 # Construct SQLAlchemy connection string dynamically
